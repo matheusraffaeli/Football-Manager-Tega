@@ -1,0 +1,94 @@
+name: Importar dados do Wikidata
+
+on:
+  push:
+    paths:
+      - .github/workflows/importar.yml
+
+permissions:
+  contents: write
+
+jobs:
+  importar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Baixar do Wikidata
+        run: |
+          cat > fetch.mjs <<'SCRIPT_END'
+          // Baixa do Wikidata (CC0) os candidatos de cada clube e os jogadores com vínculo desde 2025.
+          import { mkdirSync, writeFileSync } from 'node:fs';
+          const UA = 'FootballManagerTega/0.1 (projeto pessoal; GitHub Actions)';
+          const CLUBS = [{"id": 1, "names": ["Athletico Paranaense", "Athletico-PR"]}, {"id": 2, "names": ["Atlético Mineiro", "Atlético-MG"]}, {"id": 3, "names": ["Bahia"]}, {"id": 4, "names": ["Botafogo"]}, {"id": 5, "names": ["Chapecoense"]}, {"id": 6, "names": ["Corinthians"]}, {"id": 7, "names": ["Coritiba"]}, {"id": 8, "names": ["Cruzeiro"]}, {"id": 9, "names": ["Flamengo"]}, {"id": 10, "names": ["Fluminense"]}, {"id": 11, "names": ["Grêmio"]}, {"id": 12, "names": ["Internacional"]}, {"id": 13, "names": ["Mirassol"]}, {"id": 14, "names": ["Palmeiras"]}, {"id": 15, "names": ["Red Bull Bragantino", "Bragantino"]}, {"id": 16, "names": ["Remo"]}, {"id": 17, "names": ["Santos"]}, {"id": 18, "names": ["São Paulo"]}, {"id": 19, "names": ["Vasco da Gama", "Vasco"]}, {"id": 20, "names": ["Vitória"]}, {"id": 21, "names": ["América Mineiro", "América-MG"]}, {"id": 22, "names": ["Athletic Club", "Athletic-MG"]}, {"id": 23, "names": ["Atlético Goianiense", "Atlético-GO"]}, {"id": 24, "names": ["Avaí"]}, {"id": 25, "names": ["Botafogo-SP"]}, {"id": 26, "names": ["Ceará"]}, {"id": 27, "names": ["CRB"]}, {"id": 28, "names": ["Criciúma"]}, {"id": 29, "names": ["Cuiabá"]}, {"id": 30, "names": ["Fortaleza"]}, {"id": 31, "names": ["Goiás"]}, {"id": 32, "names": ["Juventude"]}, {"id": 33, "names": ["Londrina"]}, {"id": 34, "names": ["Náutico"]}, {"id": 35, "names": ["Novorizontino"]}, {"id": 36, "names": ["Operário Ferroviário", "Operário-PR"]}, {"id": 37, "names": ["Ponte Preta"]}, {"id": 38, "names": ["São Bernardo"]}, {"id": 39, "names": ["Sport"]}, {"id": 40, "names": ["Vila Nova"]}];
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          async function get(url, tries = 4) {
+            for (let i = 1; ; i++) {
+              const res = await fetch(url, { headers: { 'User-Agent': UA, Accept: 'application/json, application/sparql-results+json' } });
+              if (res.ok) return res.json();
+              if (i >= tries) throw new Error(`HTTP ${res.status} em ${url.slice(0, 120)}`);
+              await sleep(5000 * i);
+            }
+          }
+          const sparql = (q) => get(`https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(q)}`);
+          const out = { fetchedAt: new Date().toISOString(), source: 'Wikidata (CC0)', clubs: [], players: { head: { vars: [] }, results: { bindings: [] } } };
+          for (const club of CLUBS) {
+            const found = new Set();
+            for (const name of club.names) {
+              for (const lang of ['pt', 'en']) {
+                const r = await get(`https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&type=item&limit=10&language=${lang}&search=${encodeURIComponent(name)}`);
+                for (const s of r.search ?? []) found.add(s.id);
+                await sleep(300);
+              }
+            }
+            let candidates = [];
+            if (found.size) {
+              const r = await sparql(`SELECT ?c ?cLabel ?cDescription WHERE { VALUES ?c { ${[...found].map((q) => 'wd:' + q).join(' ')} } ?c wdt:P31/wdt:P279* wd:Q476028 ; wdt:P17 wd:Q155 . SERVICE wikibase:label { bd:serviceParam wikibase:language "pt,en". } }`);
+              const seen = new Set();
+              for (const b of r.results.bindings) {
+                const qid = b.c.value.split('/').pop();
+                if (seen.has(qid)) continue;
+                seen.add(qid);
+                candidates.push({ qid, label: b.cLabel?.value ?? '', description: b.cDescription?.value ?? '' });
+              }
+            }
+            out.clubs.push({ id: club.id, names: club.names, candidates });
+            console.log(`${club.names[0]}: ${candidates.map((c) => c.qid + ' ' + c.label).join(' | ') || 'NENHUM'}`);
+            for (const c of candidates) {
+              const q = `SELECT ?player ?playerLabel ?birth ?nat ?positionLabel ?height ?footLabel ?club ?start ?end ?number WHERE {
+            VALUES ?club { wd:${c.qid} }
+            ?player p:P54 ?st . ?st ps:P54 ?club .
+            OPTIONAL { ?st pq:P580 ?start } OPTIONAL { ?st pq:P582 ?end } OPTIONAL { ?st pq:P1618 ?number }
+            FILTER(!BOUND(?end) || ?end >= "2025-01-01T00:00:00Z"^^xsd:dateTime)
+            ?player wdt:P106 wd:Q937857 .
+            OPTIONAL { ?player wdt:P569 ?birth }
+            OPTIONAL { ?player wdt:P27 ?ct . ?ct wdt:P298 ?nat }
+            OPTIONAL { ?player wdt:P413 ?position }
+            OPTIONAL { ?player wdt:P2048 ?height }
+            OPTIONAL { ?player wdt:P552 ?foot }
+            SERVICE wikibase:label { bd:serviceParam wikibase:language "pt,en". }
+          }`;
+              const r = await sparql(q);
+              out.players.head.vars = r.head.vars;
+              out.players.results.bindings.push(...r.results.bindings);
+              console.log(`  ${c.qid}: ${r.results.bindings.length} linhas`);
+              await sleep(1500);
+            }
+            // Vínculos com clubes de fora do lote (para saber quem saiu): segunda consulta por jogador seria cara;
+            // o pipeline trata isso como "para revisão".
+          }
+          mkdirSync('data', { recursive: true });
+          writeFileSync('data/wikidata-brasil-2026.json', JSON.stringify(out));
+          console.log(`Total: ${out.players.results.bindings.length} linhas de jogadores`);
+          SCRIPT_END
+          node fetch.mjs
+      - name: Salvar no repositório
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add data/wikidata-brasil-2026.json
+          git commit -m "Dados do Wikidata $(date -u +%Y-%m-%dT%H:%MZ)" || echo "sem mudanças"
+          git push
